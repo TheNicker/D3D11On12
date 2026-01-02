@@ -6,4 +6,8 @@ project(d3d11on12)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+#add_compile_options(/arm64EC)
+
+set(USE_PIX OFF)
+
 add_subdirectory(src)
