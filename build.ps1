@@ -122,20 +122,48 @@ function Resolve-SystemLibraries {
   $resolved
 }
 
-function Invoke-VsCommand {
+function Import-VsDevEnvironment {
   param(
-    [Parameter(Mandatory = $true)][string]$VsDevCmd,
-    [Parameter(Mandatory = $true)][string]$CommandLine,
-    [string]$Arch = "amd64",
+    [Parameter(Mandatory = $true)][pscustomobject]$VsEnv,
+    [Parameter(Mandatory = $true)][string]$TargetArch
+  )
+
+  $hostArch = if ($VsEnv.HostArch) { $VsEnv.HostArch } else { "x64" }
+  if ($VsEnv.CurrentArch -eq $TargetArch) { return }
+
+  Write-Host ("[vsenv] Importing environment for arch {0}" -f $TargetArch) -ForegroundColor Cyan
+  $invocation = "call `"$($VsEnv.VsDevCmd)`" -host_arch=$hostArch -arch=$TargetArch && set"
+  $envLines = cmd.exe /c $invocation
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -ne 0) {
+    throw ("VsDevCmd invocation failed with exit code {0} using arch {1}." -f $exitCode, $TargetArch)
+  }
+
+  foreach ($line in $envLines) {
+    if ($line -match "^(.*?)=(.*)$") {
+      $name = $matches[1]
+      if ($name.StartsWith("=")) { continue }
+      Set-Item -Path ("Env:{0}" -f $name) -Value $matches[2] -Force
+    }
+  }
+  $VsEnv | Add-Member -NotePropertyName CurrentArch -NotePropertyValue $TargetArch -Force
+}
+
+function Invoke-ExternalCommand {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [string[]]$Arguments,
     [string]$Tag
   )
-  $archArg = if ([string]::IsNullOrWhiteSpace($Arch)) { "" } else { "-arch=$Arch" }
+
   $prefix = if ($Tag) { "[{0}] " -f $Tag } else { "" }
-  Write-Host ("{0}{1}" -f $prefix, $CommandLine) -ForegroundColor Cyan
-  $wrapped = "call `"$VsDevCmd`" -host_arch=amd64 $archArg >nul && $CommandLine"
-  $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/d","/s","/c",$wrapped -NoNewWindow -Wait -PassThru
-  if ($proc.ExitCode -ne 0) {
-    throw ("Command failed with exit code {0}: {1}" -f $proc.ExitCode, $CommandLine)
+  $displaySuffix = if ($Arguments -and $Arguments.Count -gt 0) { " {0}" -f ($Arguments -join ' ') } else { "" }
+  Write-Host ("{0}{1}{2}" -f $prefix, $FilePath, $displaySuffix) -ForegroundColor Cyan
+
+  & $FilePath @Arguments
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -ne 0) {
+    throw ("Command failed with exit code {0}: {1}{2}" -f $exitCode, $FilePath, $displaySuffix)
   }
 }
 
@@ -161,12 +189,14 @@ function Get-VsEnvironment {
   [PSCustomObject]@{
     VsRoot   = $installPath
     VsDevCmd = $vsDevCmd
+    HostArch = "x64"
+    CurrentArch = $null
   }
 }
 
 function Configure-CMake {
   param(
-    [string]$VsDevCmd,
+    [pscustomobject]$VsEnv,
     [string]$Source,
     [string]$BuildDir,
     [string]$Generator,
@@ -175,14 +205,20 @@ function Configure-CMake {
     [string]$LinkRspPath,
     [ValidateSet("LinkRepro","LinkReproFullPathRsp")][string]$ReproMode = "LinkReproFullPathRsp"
   )
+
+  Import-VsDevEnvironment -VsEnv $VsEnv -TargetArch $Arch
   Ensure-Directory $BuildDir
-  $args = @(
-    "cmake",
-    "-S `"$Source`"",
-    "-B `"$BuildDir`"",
-    "-G `"$Generator`"",
-    "-A $Arch"
-  )
+
+  $args = New-Object 'System.Collections.Generic.List[string]'
+  $args.Add("-S")
+  $args.Add($Source)
+  $args.Add("-B")
+  $args.Add($BuildDir)
+  $args.Add("-G")
+  $args.Add($Generator)
+  $args.Add("-A")
+  $args.Add($Arch)
+
   if ($LinkRspPath) {
     $configKey = $Config.ToUpperInvariant()
     $flagVar = "CMAKE_SHARED_LINKER_FLAGS_{0}" -f $configKey
@@ -190,23 +226,34 @@ function Configure-CMake {
       "LinkRepro" { "/LINKREPRO:$LinkRspPath" }
       default { "/LINKREPROFULLPATHRSP:$LinkRspPath" }
     }
-    $args += ('-D {0}={1}' -f $flagVar, $flagValue)
+    $args.Add(('-D{0}={1}' -f $flagVar, $flagValue))
   }
-  $cmd = $args -join ' '
-  Invoke-VsCommand -VsDevCmd $VsDevCmd -CommandLine $cmd -Arch "amd64" -Tag ("configure-{0}" -f $Arch)
+
+  Invoke-ExternalCommand -FilePath "cmake" -Arguments $args.ToArray() -Tag ("configure-{0}" -f $Arch)
 }
 
 function Build-CMake {
   param(
-    [string]$VsDevCmd,
+    [pscustomobject]$VsEnv,
     [string]$BuildDir,
     [string]$Config,
     [string]$Target,
     [string]$Arch
   )
-  $cmd = "cmake --build `"$BuildDir`" --config $Config --target $Target -- /m"
-  $vsArch = "amd64"
-  Invoke-VsCommand -VsDevCmd $VsDevCmd -CommandLine $cmd -Arch $vsArch -Tag ("build-{0}" -f $Arch)
+
+  Import-VsDevEnvironment -VsEnv $VsEnv -TargetArch $Arch
+
+  $args = New-Object 'System.Collections.Generic.List[string]'
+  $args.Add("--build")
+  $args.Add($BuildDir)
+  $args.Add("--config")
+  $args.Add($Config)
+  $args.Add("--target")
+  $args.Add($Target)
+  $args.Add("--")
+  $args.Add("/m")
+
+  Invoke-ExternalCommand -FilePath "cmake" -Arguments $args.ToArray() -Tag ("build-{0}" -f $Arch)
 }
 
 function Parse-LinkRsp {
@@ -589,7 +636,7 @@ function Invoke-ConfigureStage {
   if ($SkipConfigureArm64) {
     Write-Host "Configure (ARM64) : skipped"
   } else {
-    Configure-CMake -VsDevCmd $Context.VsEnv.VsDevCmd -Source $Context.SourceRoot -BuildDir $Context.BuildDirs.arm64 -Generator $Context.Generator -Arch "arm64" -Config $Context.Config -LinkRspPath $Context.RspPaths.arm64
+    Configure-CMake -VsEnv $Context.VsEnv -Source $Context.SourceRoot -BuildDir $Context.BuildDirs.arm64 -Generator $Context.Generator -Arch "arm64" -Config $Context.Config -LinkRspPath $Context.RspPaths.arm64
   }
 
   if ($SkipConfigureArm64EC) {
@@ -600,7 +647,7 @@ function Invoke-ConfigureStage {
       Remove-Item -Path $arm64EcReproDir -Recurse -Force
     }
     Ensure-Directory $arm64EcReproDir
-    Configure-CMake -VsDevCmd $Context.VsEnv.VsDevCmd -Source $Context.SourceRoot -BuildDir $Context.BuildDirs.arm64ec -Generator $Context.Generator -Arch "arm64ec" -Config $Context.Config -LinkRspPath $arm64EcReproDir -ReproMode "LinkRepro"
+    Configure-CMake -VsEnv $Context.VsEnv -Source $Context.SourceRoot -BuildDir $Context.BuildDirs.arm64ec -Generator $Context.Generator -Arch "arm64ec" -Config $Context.Config -LinkRspPath $arm64EcReproDir -ReproMode "LinkRepro"
   }
 }
 
@@ -620,13 +667,13 @@ function Invoke-BuildStage {
   if ($SkipBuildArm64) {
     Write-Host "Build (ARM64) : skipped"
   } else {
-    Build-CMake -VsDevCmd $Context.VsEnv.VsDevCmd -BuildDir $Context.BuildDirs.arm64 -Config $Context.Config -Target $Context.Targets.Target -Arch "arm64"
+    Build-CMake -VsEnv $Context.VsEnv -BuildDir $Context.BuildDirs.arm64 -Config $Context.Config -Target $Context.Targets.Target -Arch "arm64"
   }
 
   if ($SkipBuildArm64EC) {
     Write-Host "Build (ARM64EC) : skipped"
   } else {
-    Build-CMake -VsDevCmd $Context.VsEnv.VsDevCmd -BuildDir $Context.BuildDirs.arm64ec -Config $Context.Config -Target $Context.Targets.Target -Arch "arm64ec"
+    Build-CMake -VsEnv $Context.VsEnv -BuildDir $Context.BuildDirs.arm64ec -Config $Context.Config -Target $Context.Targets.Target -Arch "arm64ec"
   }
 }
 
@@ -643,6 +690,7 @@ function Invoke-LinkStage {
   }
 
   Ensure-Arm64EcFullRsp -Context $Context | Out-Null
+  Import-VsDevEnvironment -VsEnv $Context.VsEnv -TargetArch "arm64"
   $arm64EcData = Parse-LinkRsp -Path $Context.RspPaths.arm64ec
   $arm64Data = Parse-LinkRsp -Path $Context.RspPaths.arm64
 
@@ -654,28 +702,22 @@ function Invoke-LinkStage {
     Remove-ExistingFile -Path $artifact
   }
 
-  $linkArgs = @(
-    "/nologo",
-    "/dll",
-    "/MACHINE:ARM64X",
-    ('/OUT:"{0}"' -f $Context.Targets.Dll),
-    ('/PDB:"{0}"' -f $Context.Targets.Pdb),
-    ('/IMPLIB:"{0}"' -f $Context.Targets.Lib)
-  )
-  $cmdParts = New-Object System.Collections.Generic.List[string]
-  foreach ($arg in $linkArgs) { $cmdParts.Add($arg) }
-  # Feed ARM64EC response first so the tk/link driver treats it as primary, then append ARM64 inputs.
-  $cmdParts.Add(('^@"{0}"' -f $Context.RspPaths.arm64ec))
-  $cmdParts.Add(('^@"{0}"' -f $Context.RspPaths.arm64))
-  $cmdParts.Add("/MACHINE:ARM64X")
+  $linkArgs = New-Object 'System.Collections.Generic.List[string]'
+  $linkArgs.Add('"@{0}"' -f $Context.RspPaths.arm64ec)
+  $linkArgs.Add('"@{0}"' -f $Context.RspPaths.arm64)
+  $linkArgs.Add("/nologo")
+  $linkArgs.Add("/dll")
+  $linkArgs.Add("/MACHINE:ARM64X")
+  $linkArgs.Add('/OUT:"{0}"' -f $Context.Targets.Dll)
+  $linkArgs.Add('/PDB:"{0}"' -f $Context.Targets.Pdb)
+  $linkArgs.Add('/IMPLIB:"{0}"' -f $Context.Targets.Lib)
 
   
   foreach ($extra in $plan.ExtraLibs) {
     $formatted = Format-LinkToken -Token $extra
-    if ($formatted) { $cmdParts.Add($formatted) }
+    if ($formatted) { $linkArgs.Add($formatted) }
   }
-  $linkCmd = "link.exe {0}" -f ($cmdParts -join ' ')
-  Invoke-VsCommand -VsDevCmd $Context.VsEnv.VsDevCmd -CommandLine $linkCmd -Arch "amd64" -Tag "link-arm64x"
+  Invoke-ExternalCommand -FilePath "link.exe" -Arguments $linkArgs.ToArray() -Tag "link-arm64x"
 
   Write-Host ""
   Write-Host ("Hybrid DLL : {0}" -f $Context.Targets.Dll) -ForegroundColor Green
