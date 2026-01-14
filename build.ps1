@@ -24,11 +24,18 @@ param(
   [switch]$SkipBuildArm64EC,
   [switch]$SkipProjectBuild,
   [switch]$SkipLink,
-  [string]$Def
+  [string]$Def,
+  [switch]$KeepArm64Res
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if (-not (Test-Path variable:script:VsEnvCache)) {
+  $script:VsEnvCache = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
+  $script:VsEnvCurrentArch = $null
+  $script:VsEnvCurrentKeys = @()
+}
 
 function Resolve-FullPath {
   param(
@@ -128,24 +135,53 @@ function Import-VsDevEnvironment {
     [Parameter(Mandatory = $true)][string]$TargetArch
   )
 
+  if ($TargetArch -eq "arm64ec")
+  {
+    $TargetArch= "arm64"
+  }
   $hostArch = if ($VsEnv.HostArch) { $VsEnv.HostArch } else { "x64" }
-  if ($VsEnv.CurrentArch -eq $TargetArch) { return }
+  $normalizedArch = if ([string]::IsNullOrWhiteSpace($TargetArch)) { "amd64" } else { $TargetArch.ToLowerInvariant() }
+  if ($script:VsEnvCurrentArch -eq $normalizedArch) { return }
 
-  Write-Host ("[vsenv] Importing environment for arch {0}" -f $TargetArch) -ForegroundColor Cyan
-  $invocation = "call `"$($VsEnv.VsDevCmd)`" -host_arch=$hostArch -arch=$TargetArch && set"
-  $envLines = cmd.exe /c $invocation
-  $exitCode = $LASTEXITCODE
-  if ($exitCode -ne 0) {
-    throw ("VsDevCmd invocation failed with exit code {0} using arch {1}." -f $exitCode, $TargetArch)
+  
+  $envSnapshot = $null
+  if (-not ($script:VsEnvCache.ContainsKey($normalizedArch))) {
+    Write-Host ("[vsenv] Importing environment for arch {0}" -f $TargetArch) -ForegroundColor Cyan
+    $invocation = "call `"$($VsEnv.VsDevCmd)`" -host_arch=$hostArch -arch=$TargetArch && set"
+    $envLines = cmd.exe /c $invocation
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+      throw ("VsDevCmd invocation failed with exit code {0} using arch {1}." -f $exitCode, $TargetArch)
+    }
+
+    $envSnapshot = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($line in $envLines) {
+      if ($line -match "^(.*?)=(.*)$") {
+        $name = $matches[1]
+        if ($name.StartsWith("=")) { continue }
+        $envSnapshot[$name] = $matches[2]
+      }
+    }
+    $script:VsEnvCache[$normalizedArch] = $envSnapshot
+  } else {
+    $envSnapshot = [System.Collections.Hashtable]$script:VsEnvCache[$normalizedArch]
+    Write-Host ("[vsenv] Restoring cached environment for arch {0}" -f $TargetArch) -ForegroundColor Cyan
   }
 
-  foreach ($line in $envLines) {
-    if ($line -match "^(.*?)=(.*)$") {
-      $name = $matches[1]
-      if ($name.StartsWith("=")) { continue }
-      Set-Item -Path ("Env:{0}" -f $name) -Value $matches[2] -Force
+  if ($script:VsEnvCurrentKeys) {
+    foreach ($prevKey in $script:VsEnvCurrentKeys) {
+      if (-not $envSnapshot.ContainsKey($prevKey)) {
+        Remove-Item -Path ("Env:{0}" -f $prevKey) -ErrorAction SilentlyContinue
+      }
     }
   }
+
+  foreach ($entry in $envSnapshot.GetEnumerator()) {
+    Set-Item -Path ("Env:{0}" -f $entry.Key) -Value $entry.Value -Force
+  }
+
+  $script:VsEnvCurrentArch = $normalizedArch
+  $script:VsEnvCurrentKeys = @($envSnapshot.Keys)
   $VsEnv | Add-Member -NotePropertyName CurrentArch -NotePropertyValue $TargetArch -Force
 }
 
@@ -219,15 +255,26 @@ function Configure-CMake {
   $args.Add("-A")
   $args.Add($Arch)
 
+  $configKey = $Config.ToUpperInvariant()
+  $linkFlags = New-Object 'System.Collections.Generic.List[string]'
   if ($LinkRspPath) {
-    $configKey = $Config.ToUpperInvariant()
-    $flagVar = "CMAKE_SHARED_LINKER_FLAGS_{0}" -f $configKey
-    $flagValue = switch ($ReproMode) {
+    $linkFlagBase = switch ($ReproMode) {
       "LinkRepro" { "/LINKREPRO:$LinkRspPath" }
       default { "/LINKREPROFULLPATHRSP:$LinkRspPath" }
     }
-    $args.Add(('-D{0}={1}' -f $flagVar, $flagValue))
+    $linkFlags.Add($linkFlagBase)
   }
+  if (-not ($linkFlags -contains "/DEBUG")) {
+    $linkFlags.Add("/DEBUG")
+  }
+  $sharedLinkerVar = "CMAKE_SHARED_LINKER_FLAGS_{0}" -f $configKey
+  $args.Add(('-D{0}={1}' -f $sharedLinkerVar, ($linkFlags -join ' ')))
+
+  $compilerFlags = "/Zi /Od /Ob0"
+  $cFlagsVar = "CMAKE_C_FLAGS_{0}" -f $configKey
+  $cxxFlagsVar = "CMAKE_CXX_FLAGS_{0}" -f $configKey
+  $args.Add(('-D{0}={1}' -f $cFlagsVar, $compilerFlags))
+  $args.Add(('-D{0}={1}' -f $cxxFlagsVar, $compilerFlags))
 
   Invoke-ExternalCommand -FilePath "cmake" -Arguments $args.ToArray() -Tag ("configure-{0}" -f $Arch)
 }
@@ -379,6 +426,56 @@ function Convert-LinkRspToFullPaths {
   }
   [System.IO.File]::WriteAllLines($OutputRsp, $converted)
   $OutputRsp
+}
+
+function Get-RspWithoutResources {
+  param(
+    [Parameter(Mandatory = $true)][string]$RspPath
+  )
+
+  if (-not (Test-Path $RspPath)) { return $RspPath }
+
+  $lines = [System.IO.File]::ReadAllLines($RspPath)
+  $filtered = New-Object 'System.Collections.Generic.List[string]'
+  $removed = $false
+
+  foreach ($line in $lines) {
+    $trim = $line.Trim()
+    if (-not $trim) {
+      $filtered.Add($line)
+      continue
+    }
+    if ($trim.StartsWith("#")) {
+      $filtered.Add($line)
+      continue
+    }
+
+    $token = $trim
+    if ($token.StartsWith('"') -and $token.EndsWith('"') -and $token.Length -ge 2) {
+      $token = $token.Substring(1, $token.Length - 2)
+    }
+    if ($token.StartsWith("/") -or $token.StartsWith("-")) {
+      $filtered.Add($line)
+      continue
+    }
+
+    $extension = [System.IO.Path]::GetExtension($token)
+    if ($extension -and $extension.Equals(".res", [System.StringComparison]::OrdinalIgnoreCase)) {
+      $removed = $true
+      continue
+    }
+
+    $filtered.Add($line)
+  }
+
+  if (-not $removed) { return $RspPath }
+
+  $directory = Split-Path $RspPath -Parent
+  $baseName = [System.IO.Path]::GetFileNameWithoutExtension($RspPath)
+  $extension = [System.IO.Path]::GetExtension($RspPath)
+  $filteredPath = Join-Path $directory ("{0}-nores{1}" -f $baseName, $extension)
+  [System.IO.File]::WriteAllLines($filteredPath, $filtered)
+  $filteredPath
 }
 
 function Ensure-Arm64EcFullRsp {
@@ -584,9 +681,11 @@ function New-BuildContext {
   $targets = Resolve-TargetArtifacts -TargetDll $TargetDll -OutDir $OutDir -SourceDir $sourceRoot -Config $Config
   $vsEnv = Get-VsEnvironment -VsWhereOverride $VsWhere
 
+  $buildArm64Root = Join-Path $sourceRoot "build-arm64"
+  $buildArm64EcRoot = Join-Path $sourceRoot "build-arm64ec"
   $buildDirs = @{
-    arm64   = Join-Path $sourceRoot "build-arm64"
-    arm64ec = Join-Path $sourceRoot "build-arm64ec"
+    arm64   = Join-Path $buildArm64Root $Config
+    arm64ec = Join-Path $buildArm64EcRoot $Config
   }
 
   $arm64Rsp = Join-Path $buildDirs.arm64 ("link-arm64-{0}.rsp" -f $Config.ToLowerInvariant())
@@ -681,7 +780,8 @@ function Invoke-LinkStage {
   param(
     [PSCustomObject]$Context,
     [switch]$SkipLink,
-    [string]$Def
+    [string]$Def,
+    [switch]$KeepArm64Res
   )
 
   if ($SkipLink) {
@@ -702,18 +802,37 @@ function Invoke-LinkStage {
     Remove-ExistingFile -Path $artifact
   }
 
+  $arm64RspPath = $Context.RspPaths.arm64
+  if (-not $KeepArm64Res) {
+    $arm64RspFiltered = Get-RspWithoutResources -RspPath $arm64RspPath
+    if ($arm64RspFiltered -ne $arm64RspPath) {
+      Write-Host ("[link] Using filtered ARM64 response: {0}" -f $arm64RspFiltered) -ForegroundColor Yellow
+      $arm64RspPath = $arm64RspFiltered
+      $Context.RspPaths.arm64 = $arm64RspPath
+    }
+  }
+
+  $extraLibs = @()
+  if ($plan.ExtraLibs) {
+    if ($plan.ExtraLibs -is [string]) {
+      $extraLibs = @($plan.ExtraLibs)
+    } else {
+      $extraLibs = @($plan.ExtraLibs | Where-Object { $_ })
+    }
+  }
+
   $linkArgs = New-Object 'System.Collections.Generic.List[string]'
-  $linkArgs.Add('"@{0}"' -f $Context.RspPaths.arm64ec)
-  $linkArgs.Add('"@{0}"' -f $Context.RspPaths.arm64)
+  $linkArgs.Add('@{0}' -f $Context.RspPaths.arm64ec)
+  $linkArgs.Add('@{0}' -f $arm64RspPath)
   $linkArgs.Add("/nologo")
   $linkArgs.Add("/dll")
   $linkArgs.Add("/MACHINE:ARM64X")
-  $linkArgs.Add('/OUT:"{0}"' -f $Context.Targets.Dll)
-  $linkArgs.Add('/PDB:"{0}"' -f $Context.Targets.Pdb)
-  $linkArgs.Add('/IMPLIB:"{0}"' -f $Context.Targets.Lib)
+  $linkArgs.Add('/OUT:{0}' -f (Format-LinkToken -Token $Context.Targets.Dll))
+  $linkArgs.Add('/PDB:{0}' -f (Format-LinkToken -Token $Context.Targets.Pdb))
+  $linkArgs.Add('/IMPLIB:{0}' -f (Format-LinkToken -Token $Context.Targets.Lib))
 
   
-  foreach ($extra in $plan.ExtraLibs) {
+  foreach ($extra in $extraLibs) {
     $formatted = Format-LinkToken -Token $extra
     if ($formatted) { $linkArgs.Add($formatted) }
   }
@@ -724,8 +843,8 @@ function Invoke-LinkStage {
   Write-Host ("PDB        : {0}" -f $Context.Targets.Pdb) -ForegroundColor Green
   Write-Host ("Import Lib : {0}" -f $Context.Targets.Lib) -ForegroundColor Green
   Write-Host ("Responses  : {0}; {1}" -f $Context.RspPaths.arm64ec, $Context.RspPaths.arm64) -ForegroundColor Green
-  if ($plan.ExtraLibs -and $plan.ExtraLibs.Count -gt 0) {
-    Write-Host ("Extra Libs : {0}" -f ($plan.ExtraLibs -join "; ")) -ForegroundColor Green
+  if ($extraLibs.Count -gt 0) {
+    Write-Host ("Extra Libs : {0}" -f ($extraLibs -join "; ")) -ForegroundColor Green
   }
 }
 
@@ -745,7 +864,8 @@ function Invoke-Main {
     [switch]$SkipBuildArm64EC,
     [switch]$SkipProjectBuild,
     [switch]$SkipLink,
-    [string]$Def
+    [string]$Def,
+    [switch]$KeepArm64Res
   )
 
   $context = New-BuildContext -SourceDir $SourceDir -TargetDll $TargetDll -OutDir $OutDir -Config $Config -Generator $Generator -VsWhere $VsWhere
@@ -756,7 +876,7 @@ function Invoke-Main {
   $skipProjectBuildEffective = $SkipBuild -or $SkipProjectBuild
   Invoke-BuildStage -Context $context -SkipBuild:$skipProjectBuildEffective -SkipBuildArm64:$SkipBuildArm64 -SkipBuildArm64EC:$SkipBuildArm64EC
 
-  Invoke-LinkStage -Context $context -SkipLink:$SkipLink -Def $Def
+  Invoke-LinkStage -Context $context -SkipLink:$SkipLink -Def $Def -KeepArm64Res:$KeepArm64Res
 }
 
 Invoke-Main `
@@ -774,4 +894,5 @@ Invoke-Main `
   -SkipBuildArm64EC:$SkipBuildArm64EC `
   -SkipProjectBuild:$SkipProjectBuild `
   -SkipLink:$SkipLink `
-  -Def $Def
+  -Def $Def `
+  -KeepArm64Res:$KeepArm64Res
