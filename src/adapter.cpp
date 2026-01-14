@@ -4,6 +4,13 @@
 
 HRESULT WINAPI OpenAdapter_D3D11On12(_Inout_ D3D10DDIARG_OPENADAPTER* pArgs, _Inout_ D3D11On12::SOpenAdapterArgs* pArgs2)
 {
+
+    while (!IsDebuggerPresent()) {
+        Sleep(100); // Wait until debugger attaches
+    }
+    DebugBreak(); // Trigger a breakpoint once attached
+    // Your code here
+
     try
     {
         pArgs->hAdapter.pDrvPrivate = new D3D11On12::Adapter(pArgs, *pArgs2); // throw( _com_error, bad_alloc )
@@ -78,6 +85,28 @@ namespace D3D11On12
         assert(SUCCEEDED(hr));
 
         Args.D3D11On12InterfaceVersion = std::max(Args.D3D11On12InterfaceVersion, c_CurrentD3D11On12InterfaceVersion);
+
+
+
+        {
+            CComPtr<IDXGIAdapter> spDXGIAdapter;
+            LUID adapterLuid = m_pUnderlyingDevice->GetAdapterLuid();
+            CComPtr<IDXGIFactory4> spFactory;
+            if (SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&spFactory))))
+            {
+                if (SUCCEEDED(spFactory->EnumAdapterByLuid(adapterLuid, IID_PPV_ARGS(&spDXGIAdapter))))
+                {
+                    DXGI_ADAPTER_DESC desc = {};
+                    if (SUCCEEDED(spDXGIAdapter->GetDesc(&desc)))
+                    {
+                        OutputDebugStringW((std::wstring(L"Device is: ") + desc.Description + L"\n").c_str());
+                        this->m_name = desc.Description;
+                        // desc.Description contains the adapter name (as a wide string)
+                        // For example: "NVIDIA GeForce RTX 3080"
+                    }
+                }
+            }
+        }
     }
     
     //----------------------------------------------------------------------------------------------------------------------------------
