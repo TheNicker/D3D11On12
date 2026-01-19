@@ -2,14 +2,65 @@
 // Licensed under the MIT License.
 #include "pch.hpp"
 
+bool isShiftDown()
+{
+    return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+}
+
 HRESULT WINAPI OpenAdapter_D3D11On12(_Inout_ D3D10DDIARG_OPENADAPTER* pArgs, _Inout_ D3D11On12::SOpenAdapterArgs* pArgs2)
 {
 
-    while (!IsDebuggerPresent()) {
-        Sleep(100); // Wait until debugger attaches
+
+    printf("Press Shift to wait for debugger, waiting 3 seconds...\n");
+    int i = 0;
+    while (isShiftDown() == false && i < 30)
+    {
+        Sleep(100); 
+        i++;
     }
-    DebugBreak(); // Trigger a breakpoint once attached
-    // Your code here
+    const bool waitforDebugger = i < 30;
+
+    bool breakDebug = false;
+
+    if (waitforDebugger)
+    {
+        printf("Waiting for debugger.\n");
+
+        printf("Press shift again for breaking while debugger is attached.\n");
+
+        while (!IsDebuggerPresent())
+        {
+            if (isShiftDown()) 
+            {
+                breakDebug = !breakDebug;
+                if (breakDebug)
+                {
+                    printf("Will break when debugger is attached.\n");
+                }
+                else
+                {
+                    printf("Will NOT break when debugger is attached.\n");
+                }
+                
+                while (isShiftDown()) 
+                    Sleep(100);
+                
+            }
+            Sleep(100); 
+        }
+
+        if (breakDebug)
+            DebugBreak();
+    }
+    else
+    {
+        printf("Continue execution...\n");
+    }
+
+
+    
+
+    
 
     try
     {

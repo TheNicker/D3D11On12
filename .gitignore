@@ -1,0 +1,6 @@
+.vs
+/out
+/out-arm64x
+/build-arm64x
+/build-arm64ec
+/build-arm64
