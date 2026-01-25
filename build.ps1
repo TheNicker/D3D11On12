@@ -13,6 +13,7 @@ param(
   [string]$SourceDir = ".",
   [Parameter(Mandatory = $true)][string]$TargetDll,
   [ValidateSet("Debug","Release")][string]$Config = "Release",
+  [bool]$EnableOptimizations = $true,
   [string]$OutDir,
   [string]$Generator = "Visual Studio 17 2022",
   [string]$VsWhere,
@@ -239,21 +240,22 @@ function Configure-CMake {
     [string]$Arch,
     [string]$Config,
     [string]$LinkRspPath,
-    [ValidateSet("LinkRepro","LinkReproFullPathRsp")][string]$ReproMode = "LinkReproFullPathRsp"
+    [ValidateSet("LinkRepro","LinkReproFullPathRsp")][string]$ReproMode = "LinkReproFullPathRsp",
+    [switch]$EnableOptimizations
   )
 
   Import-VsDevEnvironment -VsEnv $VsEnv -TargetArch $Arch
   Ensure-Directory $BuildDir
 
-  $args = New-Object 'System.Collections.Generic.List[string]'
-  $args.Add("-S")
-  $args.Add($Source)
-  $args.Add("-B")
-  $args.Add($BuildDir)
-  $args.Add("-G")
-  $args.Add($Generator)
-  $args.Add("-A")
-  $args.Add($Arch)
+  $cmakeArgs = New-Object 'System.Collections.Generic.List[string]'
+  $cmakeArgs.Add("-S")
+  $cmakeArgs.Add($Source)
+  $cmakeArgs.Add("-B")
+  $cmakeArgs.Add($BuildDir)
+  $cmakeArgs.Add("-G")
+  $cmakeArgs.Add($Generator)
+  $cmakeArgs.Add("-A")
+  $cmakeArgs.Add($Arch)
 
   $configKey = $Config.ToUpperInvariant()
   $linkFlags = New-Object 'System.Collections.Generic.List[string]'
@@ -267,16 +269,36 @@ function Configure-CMake {
   if (-not ($linkFlags -contains "/DEBUG")) {
     $linkFlags.Add("/DEBUG")
   }
+
+  $linkFlags.Add("/STACK:0x40000,0x1000")
+
+  
+  if ($EnableOptimizations) 
+  {
+    $linkFlags.Add("/OPT:REF")
+    $linkFlags.Add("/OPT:ICF")
+    $linkFlags.Add("/INCREMENTAL:NO")
+  }
+ 
   $sharedLinkerVar = "CMAKE_SHARED_LINKER_FLAGS_{0}" -f $configKey
-  $args.Add(('-D{0}={1}' -f $sharedLinkerVar, ($linkFlags -join ' ')))
+  $cmakeArgs.Add(('-D{0}={1}' -f $sharedLinkerVar, ($linkFlags -join ' ')))
 
-  $compilerFlags = "/Zi /Od /Ob0"
-  $cFlagsVar = "CMAKE_C_FLAGS_{0}" -f $configKey
-  $cxxFlagsVar = "CMAKE_CXX_FLAGS_{0}" -f $configKey
-  $args.Add(('-D{0}={1}' -f $cFlagsVar, $compilerFlags))
-  $args.Add(('-D{0}={1}' -f $cxxFlagsVar, $compilerFlags))
-
-  Invoke-ExternalCommand -FilePath "cmake" -Arguments $args.ToArray() -Tag ("configure-{0}" -f $Arch)
+  
+  if ($EnableOptimizations) 
+  {
+    $cFlagsVar = "CMAKE_C_FLAGS_{0}" -f $configKey
+    $cxxFlagsVar = "CMAKE_CXX_FLAGS_{0}" -f $configKey
+    $compilerFlags = New-Object 'System.Collections.Generic.List[string]'
+    $compilerFlags.Add("/O2") # favor speed
+    $compilerFlags.Add("/GL") # whole program optimization
+    $compilerFlags.Add("/Gy") # function-level linking
+    $compilerFlags.Add("/Gw") # data-level linking
+    $compilerFlags.Add("/Zc:inline") # inline conformance
+    $cmakeArgs.Add(('-D{0}={1}' -f $cFlagsVar, ($compilerFlags -join ' ')))
+    $cmakeArgs.Add(('-D{0}={1}' -f $cxxFlagsVar, ($compilerFlags -join ' ')))
+  }
+  
+  Invoke-ExternalCommand -FilePath "cmake" -Arguments $cmakeArgs.ToArray() -Tag ("configure-{0}" -f $Arch)
 }
 
 function Build-CMake {
@@ -290,17 +312,17 @@ function Build-CMake {
 
   Import-VsDevEnvironment -VsEnv $VsEnv -TargetArch $Arch
 
-  $args = New-Object 'System.Collections.Generic.List[string]'
-  $args.Add("--build")
-  $args.Add($BuildDir)
-  $args.Add("--config")
-  $args.Add($Config)
-  $args.Add("--target")
-  $args.Add($Target)
-  $args.Add("--")
-  $args.Add("/m")
+  $buildArgs = New-Object 'System.Collections.Generic.List[string]'
+  $buildArgs.Add("--build")
+  $buildArgs.Add($BuildDir)
+  $buildArgs.Add("--config")
+  $buildArgs.Add($Config)
+  $buildArgs.Add("--target")
+  $buildArgs.Add($Target)
+  $buildArgs.Add("--")
+  $buildArgs.Add("/m")
 
-  Invoke-ExternalCommand -FilePath "cmake" -Arguments $args.ToArray() -Tag ("build-{0}" -f $Arch)
+  Invoke-ExternalCommand -FilePath "cmake" -Arguments $buildArgs.ToArray() -Tag ("build-{0}" -f $Arch)
 }
 
 function Parse-LinkRsp {
@@ -354,7 +376,8 @@ function Parse-LinkRsp {
 function Convert-LinkRspTokenToFullPath {
   param(
     [string]$Token,
-    [string]$BaseDir
+    [string]$BaseDir,
+    [switch]$SuppressQuotes
   )
 
   if ([string]::IsNullOrWhiteSpace($Token)) { return $Token }
@@ -367,7 +390,12 @@ function Convert-LinkRspTokenToFullPath {
 
   if ($trim -match '^[.]{1,2}[\\/].*') {
     $resolved = Resolve-FullPath -Path $trim -Base $BaseDir
+    if ($SuppressQuotes) { return $resolved }
     return ('"{0}"' -f $resolved)
+  }
+
+  if ($SuppressQuotes) {
+    return $trim
   }
 
   if ($quoted) {
@@ -387,24 +415,38 @@ function Convert-LinkRspLineToFullPaths {
   if (-not $trim) { return $Line }
   if ($trim.StartsWith("#")) { return $Line }
 
-  if ($trim.StartsWith("@")) {
-    $token = $trim.Substring(1)
-    $converted = Convert-LinkRspTokenToFullPath -Token $token -BaseDir $BaseDir
-    return ("@{0}" -f $converted)
+  $tokenLine = $trim
+  $wasQuoted = $false
+  if ($tokenLine.StartsWith('"') -and $tokenLine.EndsWith('"') -and $tokenLine.Length -ge 2) {
+    $wasQuoted = $true
+    $tokenLine = $tokenLine.Substring(1, $tokenLine.Length - 2)
   }
+  if (-not $tokenLine) { return $Line }
 
-  if ($trim.StartsWith("/")) {
-    $colonIndex = $trim.IndexOf(":")
-    if ($colonIndex -gt 0 -and $colonIndex -lt ($trim.Length - 1)) {
-      $prefix = $trim.Substring(0, $colonIndex + 1)
-      $suffix = $trim.Substring($colonIndex + 1)
-      $convertedSuffix = Convert-LinkRspTokenToFullPath -Token $suffix -BaseDir $BaseDir
-      return ("{0}{1}" -f $prefix, $convertedSuffix)
+  $result = $null
+  $suppressQuotes = $wasQuoted
+  if ($tokenLine.StartsWith("@")) {
+    $token = $tokenLine.Substring(1)
+    $converted = Convert-LinkRspTokenToFullPath -Token $token -BaseDir $BaseDir -SuppressQuotes:$suppressQuotes
+    $result = ("@{0}" -f $converted)
+  } elseif ($tokenLine.StartsWith("/")) {
+    $colonIndex = $tokenLine.IndexOf(":")
+    if ($colonIndex -gt 0 -and $colonIndex -lt ($tokenLine.Length - 1)) {
+      $prefix = $tokenLine.Substring(0, $colonIndex + 1)
+      $suffix = $tokenLine.Substring($colonIndex + 1)
+      $convertedSuffix = Convert-LinkRspTokenToFullPath -Token $suffix -BaseDir $BaseDir -SuppressQuotes:$suppressQuotes
+      $result = ("{0}{1}" -f $prefix, $convertedSuffix)
+    } else {
+      $result = $tokenLine
     }
-    return $trim
+  } else {
+    $result = Convert-LinkRspTokenToFullPath -Token $tokenLine -BaseDir $BaseDir -SuppressQuotes:$suppressQuotes
   }
 
-  Convert-LinkRspTokenToFullPath -Token $trim -BaseDir $BaseDir
+  if ($wasQuoted) {
+    return ('"{0}"' -f $result)
+  }
+  $result
 }
 
 function Convert-LinkRspToFullPaths {
@@ -724,7 +766,8 @@ function Invoke-ConfigureStage {
     [PSCustomObject]$Context,
     [switch]$SkipConfigure,
     [switch]$SkipConfigureArm64,
-    [switch]$SkipConfigureArm64EC
+    [switch]$SkipConfigureArm64EC,
+    [switch]$EnableOptimizations
   )
 
   if ($SkipConfigure) {
@@ -735,7 +778,7 @@ function Invoke-ConfigureStage {
   if ($SkipConfigureArm64) {
     Write-Host "Configure (ARM64) : skipped"
   } else {
-    Configure-CMake -VsEnv $Context.VsEnv -Source $Context.SourceRoot -BuildDir $Context.BuildDirs.arm64 -Generator $Context.Generator -Arch "arm64" -Config $Context.Config -LinkRspPath $Context.RspPaths.arm64
+    Configure-CMake -VsEnv $Context.VsEnv -Source $Context.SourceRoot -BuildDir $Context.BuildDirs.arm64 -Generator $Context.Generator -Arch "arm64" -Config $Context.Config -LinkRspPath $Context.RspPaths.arm64 -EnableOptimizations:$EnableOptimizations
   }
 
   if ($SkipConfigureArm64EC) {
@@ -746,7 +789,7 @@ function Invoke-ConfigureStage {
       Remove-Item -Path $arm64EcReproDir -Recurse -Force
     }
     Ensure-Directory $arm64EcReproDir
-    Configure-CMake -VsEnv $Context.VsEnv -Source $Context.SourceRoot -BuildDir $Context.BuildDirs.arm64ec -Generator $Context.Generator -Arch "arm64ec" -Config $Context.Config -LinkRspPath $arm64EcReproDir -ReproMode "LinkRepro"
+    Configure-CMake -VsEnv $Context.VsEnv -Source $Context.SourceRoot -BuildDir $Context.BuildDirs.arm64ec -Generator $Context.Generator -Arch "arm64ec" -Config $Context.Config -LinkRspPath $arm64EcReproDir -ReproMode "LinkRepro" -EnableOptimizations:$EnableOptimizations
   }
 }
 
@@ -825,13 +868,18 @@ function Invoke-LinkStage {
   $linkArgs.Add('@{0}' -f $Context.RspPaths.arm64ec)
   $linkArgs.Add('@{0}' -f $arm64RspPath)
   $linkArgs.Add("/nologo")
+
+  if ($EnableOptimizations)
+  {
+      $linkArgs.Add("/LTCG")
+  }
+
   $linkArgs.Add("/dll")
   $linkArgs.Add("/MACHINE:ARM64X")
   $linkArgs.Add('/OUT:{0}' -f (Format-LinkToken -Token $Context.Targets.Dll))
   $linkArgs.Add('/PDB:{0}' -f (Format-LinkToken -Token $Context.Targets.Pdb))
   $linkArgs.Add('/IMPLIB:{0}' -f (Format-LinkToken -Token $Context.Targets.Lib))
 
-  
   foreach ($extra in $extraLibs) {
     $formatted = Format-LinkToken -Token $extra
     if ($formatted) { $linkArgs.Add($formatted) }
@@ -856,6 +904,7 @@ function Invoke-Main {
     [string]$Config,
     [string]$Generator,
     [string]$VsWhere,
+    [switch]$EnableOptimizations,
     [switch]$SkipConfigure,
     [switch]$SkipConfigureArm64,
     [switch]$SkipConfigureArm64EC,
@@ -871,7 +920,7 @@ function Invoke-Main {
   $context = New-BuildContext -SourceDir $SourceDir -TargetDll $TargetDll -OutDir $OutDir -Config $Config -Generator $Generator -VsWhere $VsWhere
   Write-ContextSummary -Context $context
 
-  Invoke-ConfigureStage -Context $context -SkipConfigure:$SkipConfigure -SkipConfigureArm64:$SkipConfigureArm64 -SkipConfigureArm64EC:$SkipConfigureArm64EC
+  Invoke-ConfigureStage -Context $context -SkipConfigure:$SkipConfigure -SkipConfigureArm64:$SkipConfigureArm64 -SkipConfigureArm64EC:$SkipConfigureArm64EC -EnableOptimizations:$EnableOptimizations
 
   $skipProjectBuildEffective = $SkipBuild -or $SkipProjectBuild
   Invoke-BuildStage -Context $context -SkipBuild:$skipProjectBuildEffective -SkipBuildArm64:$SkipBuildArm64 -SkipBuildArm64EC:$SkipBuildArm64EC
@@ -886,6 +935,7 @@ Invoke-Main `
   -Config $Config `
   -Generator $Generator `
   -VsWhere $VsWhere `
+  -EnableOptimizations:$EnableOptimizations `
   -SkipConfigure:$SkipConfigure `
   -SkipConfigureArm64:$SkipConfigureArm64 `
   -SkipConfigureArm64EC:$SkipConfigureArm64EC `

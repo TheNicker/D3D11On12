@@ -2,15 +2,19 @@
 // Licensed under the MIT License.
 #include "pch.hpp"
 
-bool isShiftDown()
-{
-    return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-}
+
 
 HRESULT WINAPI OpenAdapter_D3D11On12(_Inout_ D3D10DDIARG_OPENADAPTER* pArgs, _Inout_ D3D11On12::SOpenAdapterArgs* pArgs2)
 {
 
+auto  isShiftDown = []() -> bool    
+{
+    return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+};
 
+#if (true)
+
+MessageBoxA(nullptr, "Attach debugger now and press OK to continue, or Cancel to run without debugger.", "D3D11On12 Debugger Attach", MB_OKCANCEL);
     printf("Press Shift to wait for debugger, waiting 3 seconds...\n");
     int i = 0;
     while (isShiftDown() == false && i < 30)
@@ -56,7 +60,7 @@ HRESULT WINAPI OpenAdapter_D3D11On12(_Inout_ D3D10DDIARG_OPENADAPTER* pArgs, _In
     {
         printf("Continue execution...\n");
     }
-
+#endif
 
     
 
