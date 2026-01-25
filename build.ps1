@@ -874,7 +874,7 @@ function Invoke-LinkStage {
       $linkArgs.Add("/LTCG")
   }
 
-  $linkArgs.Add("/dll")
+
   $linkArgs.Add("/MACHINE:ARM64X")
   $linkArgs.Add('/OUT:{0}' -f (Format-LinkToken -Token $Context.Targets.Dll))
   $linkArgs.Add('/PDB:{0}' -f (Format-LinkToken -Token $Context.Targets.Pdb))
