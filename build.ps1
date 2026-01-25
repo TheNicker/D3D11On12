@@ -376,7 +376,8 @@ function Parse-LinkRsp {
 function Convert-LinkRspTokenToFullPath {
   param(
     [string]$Token,
-    [string]$BaseDir
+    [string]$BaseDir,
+    [switch]$SuppressQuotes
   )
 
   if ([string]::IsNullOrWhiteSpace($Token)) { return $Token }
@@ -389,7 +390,12 @@ function Convert-LinkRspTokenToFullPath {
 
   if ($trim -match '^[.]{1,2}[\\/].*') {
     $resolved = Resolve-FullPath -Path $trim -Base $BaseDir
+    if ($SuppressQuotes) { return $resolved }
     return ('"{0}"' -f $resolved)
+  }
+
+  if ($SuppressQuotes) {
+    return $trim
   }
 
   if ($quoted) {
@@ -409,24 +415,43 @@ function Convert-LinkRspLineToFullPaths {
   if (-not $trim) { return $Line }
   if ($trim.StartsWith("#")) { return $Line }
 
-  if ($trim.StartsWith("@")) {
-    $token = $trim.Substring(1)
-    $converted = Convert-LinkRspTokenToFullPath -Token $token -BaseDir $BaseDir
-    return ("@{0}" -f $converted)
+  $tokenLine = $trim
+  $wasQuoted = $false
+  if ($tokenLine.StartsWith('"') -and $tokenLine.EndsWith('"') -and $tokenLine.Length -ge 2) {
+    $wasQuoted = $true
+    $tokenLine = $tokenLine.Substring(1, $tokenLine.Length - 2)
   }
+  if (-not $tokenLine) { return $Line }
 
-  if ($trim.StartsWith("/")) {
-    $colonIndex = $trim.IndexOf(":")
-    if ($colonIndex -gt 0 -and $colonIndex -lt ($trim.Length - 1)) {
-      $prefix = $trim.Substring(0, $colonIndex + 1)
-      $suffix = $trim.Substring($colonIndex + 1)
-      $convertedSuffix = Convert-LinkRspTokenToFullPath -Token $suffix -BaseDir $BaseDir
-      return ("{0}{1}" -f $prefix, $convertedSuffix)
+  $result = $null
+  $suppressQuotes = $wasQuoted
+  if ($tokenLine.StartsWith("@")) {
+    $token = $tokenLine.Substring(1)
+    $converted = Convert-LinkRspTokenToFullPath -Token $token -BaseDir $BaseDir -SuppressQuotes:$suppressQuotes
+    $result = ("@{0}" -f $converted)
+  } elseif ($tokenLine.StartsWith("/")) {
+    $colonIndex = $tokenLine.IndexOf(":")
+    if ($colonIndex -gt 0 -and $colonIndex -lt ($tokenLine.Length - 1)) {
+      $option = $tokenLine.Substring(0, $colonIndex).ToLowerInvariant()
+      if ($option -eq "/out" -or $option -eq "/pdb" -or $option -eq "/implib") {
+        return $null
+      } else {
+        $prefix = $tokenLine.Substring(0, $colonIndex + 1)
+        $suffix = $tokenLine.Substring($colonIndex + 1)
+        $convertedSuffix = Convert-LinkRspTokenToFullPath -Token $suffix -BaseDir $BaseDir -SuppressQuotes:$suppressQuotes
+        $result = ("{0}{1}" -f $prefix, $convertedSuffix)
+      }
+    } else {
+      $result = $tokenLine
     }
-    return $trim
+  } else {
+    $result = Convert-LinkRspTokenToFullPath -Token $tokenLine -BaseDir $BaseDir -SuppressQuotes:$suppressQuotes
   }
 
-  Convert-LinkRspTokenToFullPath -Token $trim -BaseDir $BaseDir
+  if ($wasQuoted) {
+    return ('"{0}"' -f $result)
+  }
+  $result
 }
 
 function Convert-LinkRspToFullPaths {
@@ -444,7 +469,10 @@ function Convert-LinkRspToFullPaths {
 
   $converted = New-Object System.Collections.Generic.List[string]
   foreach ($line in [System.IO.File]::ReadAllLines($SourceRsp)) {
-    $converted.Add((Convert-LinkRspLineToFullPaths -Line $line -BaseDir $baseDir))
+    $convertedLine = Convert-LinkRspLineToFullPaths -Line $line -BaseDir $baseDir
+    if ($null -ne $convertedLine) {
+      $converted.Add($convertedLine)
+    }
   }
   [System.IO.File]::WriteAllLines($OutputRsp, $converted)
   $OutputRsp
