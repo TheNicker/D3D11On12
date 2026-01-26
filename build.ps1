@@ -303,7 +303,7 @@ function Configure-CMake {
     $linkFlags.Add("/LTCG")
   }
 
-  $sharedLinkerVar = "CMAKE_SHARED_LINKER_FLAGS_{0}" -f $configKey
+  $sharedLinkerVar = "CMAKE_SHARED_LINKER_FLAGS"
   $cmakeArgs.Add(('-D{0}={1}' -f $sharedLinkerVar, ($linkFlags -join ' ')))
 
   
