@@ -10,7 +10,6 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
   [string]$SourceDir = ".",
-  [Parameter(Mandatory = $true)][string]$TargetDll,
   [ValidateSet("Debug", "Release")][string]$Config = "Release",
   [bool]$EnableOptimizations = $true,
   [string]$OutDir,
@@ -78,56 +77,6 @@ function Format-LinkToken {
     return ('"{0}"' -f $Token)
   }
   $Token
-}
-
-function Resolve-SystemLibraries {
-  param(
-    [Parameter(Mandatory = $true)][System.Collections.Generic.List[string]]$Inputs,
-    [Parameter(Mandatory = $true)][string[]]$LibraryNames
-  )
-
-  $existing = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-  $directories = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-
-  foreach ($item in $Inputs) {
-    if ([string]::IsNullOrWhiteSpace($item)) { continue }
-    $ext = [System.IO.Path]::GetExtension($item)
-    if ($ext -and $ext.Equals(".lib", [System.StringComparison]::OrdinalIgnoreCase)) {
-      $name = [System.IO.Path]::GetFileNameWithoutExtension($item)
-      if ($name) { $existing.Add($name) | Out-Null }
-      $dir = Split-Path $item -Parent
-      if ($dir) { $directories.Add($dir) | Out-Null }
-    }
-  }
-
-  $resolved = New-Object System.Collections.Generic.List[string]
-  foreach ($libName in $LibraryNames) {
-    if ($existing.Contains($libName)) { continue }
-    $targetFile = "{0}.lib" -f $libName
-    $found = $false
-    foreach ($dir in $directories) {
-      $candidate = Join-Path $dir $targetFile
-      if (Test-Path $candidate) {
-        $resolved.Add($candidate)
-        $found = $true
-        break
-      }
-    }
-    if (-not $found) {
-      foreach ($dir in $directories) {
-        $parent = Split-Path $dir -Parent
-        if (-not $parent) { continue }
-        $candidate = Join-Path $parent $targetFile
-        if (Test-Path $candidate) {
-          $resolved.Add($candidate)
-          $found = $true
-          break
-        }
-      }
-    }
-  }
-
-  $resolved
 }
 
 function Import-VsDevEnvironment {
@@ -242,7 +191,7 @@ function Configure-CMake {
     [string]$Config,
     [string]$LinkRspPath,
     [ValidateSet("LinkRepro", "LinkReproFullPathRsp")][string]$ReproMode = "LinkReproFullPathRsp",
-    [switch]$EnableOptimizations
+    [bool]$EnableOptimizations
   )
 
   Import-VsDevEnvironment -VsEnv $VsEnv -TargetArch $Arch
@@ -296,7 +245,8 @@ function Configure-CMake {
 
 
   
-  if ($EnableOptimizations) {
+  if ($EnableOptimizations) 
+  {
     $linkFlags.Add("/OPT:REF")
     $linkFlags.Add("/OPT:ICF")
     $linkFlags.Add("/INCREMENTAL:NO")
@@ -307,18 +257,25 @@ function Configure-CMake {
   $cmakeArgs.Add(('-D{0}={1}' -f $sharedLinkerVar, ($linkFlags -join ' ')))
 
   
-  if ($EnableOptimizations) {
-    $cFlagsVar = "CMAKE_C_FLAGS_{0}" -f $configKey
-    $cxxFlagsVar = "CMAKE_CXX_FLAGS_{0}" -f $configKey
-    $compilerFlags = New-Object 'System.Collections.Generic.List[string]'
+  $cFlagsVar = "CMAKE_C_FLAGS_{0}" -f $configKey
+  $cxxFlagsVar = "CMAKE_CXX_FLAGS_{0}" -f $configKey
+
+  $compilerFlags = New-Object 'System.Collections.Generic.List[string]'
+
+  $compilerFlags.Add("/Zi") # Debug info in PDB
+  $compilerFlags.Add("/Zo") # Enhanced debug info
+
+  if ($EnableOptimizations) 
+  {
     $compilerFlags.Add("/O2") # favor speed
     $compilerFlags.Add("/GL") # whole program optimization
     $compilerFlags.Add("/Gy") # function-level linking
     $compilerFlags.Add("/Gw") # data-level linking
     $compilerFlags.Add("/Zc:inline") # inline conformance
+  }
+
     $cmakeArgs.Add(('-D{0}={1}' -f $cFlagsVar, ($compilerFlags -join ' ')))
     $cmakeArgs.Add(('-D{0}={1}' -f $cxxFlagsVar, ($compilerFlags -join ' ')))
-  }
   
   Invoke-ExternalCommand -FilePath "cmake" -Arguments $cmakeArgs.ToArray() -Tag ("configure-{0}" -f $Arch)
 }
@@ -328,7 +285,6 @@ function Build-CMake {
     [pscustomobject]$VsEnv,
     [string]$BuildDir,
     [string]$Config,
-    [string]$Target,
     [string]$Arch
   )
 
@@ -339,8 +295,6 @@ function Build-CMake {
   $buildArgs.Add($BuildDir)
   $buildArgs.Add("--config")
   $buildArgs.Add($Config)
-  $buildArgs.Add("--target")
-  $buildArgs.Add($Target)
   $buildArgs.Add("--")
   $buildArgs.Add("/m")
 
@@ -413,62 +367,6 @@ function Get-OrderedUnique {
   $result
 }
 
-function Resolve-TargetArtifacts {
-  param(
-    [string]$TargetDll,
-    [string]$OutDir,
-    [string]$SourceDir,
-    [string]$Config
-  )
-
-  $resolvedOutDir = if ($OutDir) {
-    Resolve-FullPath $OutDir $SourceDir
-  }
-  else {
-    $null
-  }
-
-  if ([System.IO.Path]::IsPathRooted($TargetDll)) {
-    $dllPath = Resolve-FullPath $TargetDll
-    $dllDir = Split-Path $dllPath -Parent
-    if ($resolvedOutDir -and ($dllDir -ne $resolvedOutDir)) {
-      throw ("TargetDll directory '{0}' must match OutDir '{1}'." -f $dllDir, $resolvedOutDir)
-    }
-  }
-  else {
-    if (-not $resolvedOutDir) {
-      $resolvedOutDir = Join-Path $SourceDir ("out-arm64x\{0}" -f $Config)
-    }
-    Ensure-Directory $resolvedOutDir
-    $dllPath = Resolve-FullPath (Join-Path $resolvedOutDir $TargetDll)
-    $dllDir = Split-Path $dllPath -Parent
-  }
-
-  $ext = [System.IO.Path]::GetExtension($dllPath)
-  if ([string]::IsNullOrWhiteSpace($ext)) {
-    $dllPath = $dllPath + ".dll"
-  }
-  elseif ($ext.ToLowerInvariant() -ne ".dll") {
-    throw "TargetDll must end with the .dll extension."
-  }
-
-  $dllDir = Split-Path $dllPath -Parent
-  if (-not $resolvedOutDir) { $resolvedOutDir = $dllDir }
-  if ($dllDir -ne $resolvedOutDir) {
-    throw ("TargetDll directory '{0}' must match OutDir '{1}'." -f $dllDir, $resolvedOutDir)
-  }
-  Ensure-Directory $dllDir
-  $baseName = [System.IO.Path]::GetFileNameWithoutExtension($dllPath)
-
-  [PSCustomObject]@{
-    OutDir    = $resolvedOutDir
-    Directory = $dllDir
-    Dll       = $dllPath
-    Pdb       = Join-Path $dllDir ($baseName + ".pdb")
-    Lib       = Join-Path $dllDir ($baseName + ".lib")
-    Target    = $baseName
-  }
-}
 
 function Resolve-DefinitionOption {
   param(
@@ -492,7 +390,6 @@ function Resolve-DefinitionOption {
 function New-BuildContext {
   param(
     [string]$SourceDir,
-    [string]$TargetDll,
     [string]$OutDir,
     [string]$Config,
     [string]$Generator,
@@ -504,7 +401,6 @@ function New-BuildContext {
     throw ("CMakeLists.txt not found under '{0}'." -f $sourceRoot)
   }
 
-  $targets = Resolve-TargetArtifacts -TargetDll $TargetDll -OutDir $OutDir -SourceDir $sourceRoot -Config $Config
   $vsEnv = Get-VsEnvironment -VsWhereOverride $VsWhere
 
   $buildArm64Root = Join-Path $sourceRoot "build-arm64"
@@ -525,7 +421,6 @@ function New-BuildContext {
     SourceRoot = $sourceRoot
     Config     = $Config
     Generator  = $Generator
-    Targets    = $targets
     VsEnv      = $vsEnv
     BuildDirs  = $buildDirs
     RspPaths   = $rspPaths
@@ -536,8 +431,6 @@ function Write-ContextSummary {
   param([PSCustomObject]$Context)
 
   Write-Host "Source    : $($Context.SourceRoot)"
-  Write-Host "TargetDLL : $($Context.Targets.Dll)"
-  Write-Host "OutDir    : $($Context.Targets.OutDir)"
   Write-Host "Config    : $($Context.Config)"
   Write-Host "Generator : $($Context.Generator)"
   Write-Host "VS Root   : $($Context.VsEnv.VsRoot)"
@@ -589,14 +482,14 @@ function Invoke-BuildStage {
     Write-Host "Build (ARM64) : skipped"
   }
   else {
-    Build-CMake -VsEnv $Context.VsEnv -BuildDir $Context.BuildDirs.arm64 -Config $Context.Config -Target $Context.Targets.Target -Arch "arm64"
+    Build-CMake -VsEnv $Context.VsEnv -BuildDir $Context.BuildDirs.arm64 -Config $Context.Config -Arch "arm64"
   }
 
   if ($SkipBuildArm64EC) {
     Write-Host "Build (ARM64EC) : skipped"
   }
   else {
-    Build-CMake -VsEnv $Context.VsEnv -BuildDir $Context.BuildDirs.arm64ec -Config $Context.Config -Target $Context.Targets.Target -Arch "arm64ec"
+    Build-CMake -VsEnv $Context.VsEnv -BuildDir $Context.BuildDirs.arm64ec -Config $Context.Config -Arch "arm64ec"
   }
 }
 
@@ -605,7 +498,6 @@ function Invoke-BuildStage {
 function Invoke-Main {
   param(
     [string]$SourceDir,
-    [string]$TargetDll,
     [string]$OutDir,
     [string]$Config,
     [string]$Generator,
@@ -623,7 +515,7 @@ function Invoke-Main {
     [switch]$KeepArm64Res
   )
 
-  $context = New-BuildContext -SourceDir $SourceDir -TargetDll $TargetDll -OutDir $OutDir -Config $Config -Generator $Generator -VsWhere $VsWhere
+  $context = New-BuildContext -SourceDir $SourceDir -OutDir $OutDir -Config $Config -Generator $Generator -VsWhere $VsWhere
   Write-ContextSummary -Context $context
 
   Invoke-ConfigureStage -Context $context -SkipConfigure:$SkipConfigure -SkipConfigureArm64:$SkipConfigureArm64 -SkipConfigureArm64EC:$SkipConfigureArm64EC -EnableOptimizations:$EnableOptimizations
@@ -635,7 +527,6 @@ function Invoke-Main {
 
 Invoke-Main `
   -SourceDir $SourceDir `
-  -TargetDll $TargetDll `
   -OutDir $OutDir `
   -Config $Config `
   -Generator $Generator `
