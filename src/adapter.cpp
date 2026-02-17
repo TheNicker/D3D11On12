@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 #include "pch.hpp"
 
+extern "C" __declspec(dllexport) const std::uint32_t g_dmfl_magic_fourcc = 'DMFL';
 
 
 HRESULT WINAPI OpenAdapter_D3D11On12(_Inout_ D3D10DDIARG_OPENADAPTER* pArgs, _Inout_ D3D11On12::SOpenAdapterArgs* pArgs2)
